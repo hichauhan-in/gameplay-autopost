@@ -102,8 +102,9 @@ Field reference (each candidate object returned by `/candidates`):
 The API now:
 - returns each candidate with an explicit `rank` (1 = best), already sorted
   best -> worst;
-- renders **vertical 9:16 Shorts by default**, with fade in/out, at near-
-  lossless quality (the source resolution is preserved for the cropped frame).
+- renders the **full original frame by default** (`aspect:"source"`, no crop,
+  no fade) at near-lossless quality. Cropping to vertical Shorts is available
+  but off until we start editing.
 
 ### Goal: edit the TOP 3 clips (or fewer) into postable Shorts
 
@@ -134,22 +135,31 @@ return [{
 }];
 ```
 
-### Render node body (vertical Shorts)
+### Render node body (full clips for now)
+
+Editing (vertical crop, fades) comes later. For now render the **full,
+original frame** - the API default `aspect:"source"` does exactly that, so you
+don't need to send `aspect`/`cropMode`/`fade` at all:
 
 ```json
 {
     "path": "{{ $json.path }}",
     "jobId": "{{ $json.jobId }}",
-    "aspect": "9:16",
-    "cropMode": "center",
-    "fade": 0.5,
-    "clips": {{ JSON.stringify($json.topClips.map(c => ({
-        start: c.start,
-        end: c.end,
-        rank: c.rank
-    }))) }}
+    "clips": {{ JSON.stringify(
+        ($json.topClips || $json.allCandidates || ($json.best ? [$json.best] : []))
+            .slice(0, 3)
+            .map(c => ({ start: c.start, end: c.end, rank: c.rank || 0 }))
+    ) }}
 }
 ```
+
+This still gives you the **top 3 ranked clips** at near-lossless quality with
+the source resolution preserved (4K stays 4K). When we start editing, add
+`"aspect": "9:16"`, `"cropMode": "center"`, `"fade": 0.5` to switch to Shorts.
+
+> Make sure the Render node's input item still has `path` and `jobId` (they
+> come from the **Job Info** node). If Pick Best drops them, add them back
+> there.
 
 The response is `{ "clips": [ "work/<jobId>/renders/clip_1.mp4", ... ] }` where
 `clip_1` is the best. Post them in numeric order.

@@ -743,18 +743,19 @@ class RenderIn(BaseModel):
     path: str
     jobId: str
     clips: list[RenderClip]
-    # Output framing. "9:16" = YouTube/Instagram Shorts (default), "4:5",
-    # "1:1", "16:9", or "source" to keep the original frame untouched.
-    aspect: str = "9:16"
-    # How to reach the target aspect:
+    # Output framing. Default "source" keeps the ORIGINAL full frame untouched
+    # (no cropping) - editing comes later. Set to "9:16" for Shorts, or "4:5",
+    # "1:1", "16:9".
+    aspect: str = "source"
+    # How to reach the target aspect (only used when aspect != "source"):
     #   "center" - crop the centre strip and fill the frame (most engaging
     #              for gameplay, but loses the left/right edges)
     #   "blur"   - whole frame fitted over a zoomed, blurred copy of itself
     #              (keeps all gameplay + HUD, no hard black bars)
     #   "fit"    - whole frame letterboxed on black
     cropMode: str = "center"
-    # Fade-in / fade-out duration in seconds (0 disables).
-    fade: float = 0.5
+    # Fade-in / fade-out duration in seconds (0 = none, the default for now).
+    fade: float = 0.0
 
 def detect_scenes(full, min_threshold=0.12):
 
@@ -988,9 +989,9 @@ def render_clip(
     start,
     end,
     output,
-    aspect="9:16",
+    aspect="source",
     crop_mode="center",
-    fade=0.5
+    fade=0.0
 ):
 
     duration = end - start
