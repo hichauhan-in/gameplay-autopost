@@ -332,6 +332,73 @@ Never explain your answer.
 Return JSON only.
 """
 
+def parse_vision_response(data):
+
+    gameplay = bool(
+        data.get("gameplay", True)
+    )
+
+    approve = bool(
+        data.get("approve", True)
+    )
+
+    confidence = float(
+        data.get("confidence", 0.5)
+    )
+
+    reason = str(
+        data.get("reason", "")
+    )
+
+    return (
+        gameplay,
+        approve,
+        confidence,
+        reason
+    )
+
+def vision_failed(e):
+
+    return (
+        True,
+        True,
+        0.5,
+        f"vision-failed: {e}"
+    )
+
+def normalize_feature(
+    frames,
+    source_key,
+    target_key
+):
+
+    values = [
+        f[source_key]
+        for f in frames
+    ]
+
+    min_value = min(values)
+    max_value = max(values)
+
+    for frame in frames:
+
+        if max_value == min_value:
+            frame[target_key] = 0.5
+        else:
+            frame[target_key] = (
+                frame[source_key] - min_value
+            ) / (max_value - min_value)
+
+    print(f"\n{target_key}", flush=True)
+
+    for frame in frames:
+        print(
+            frame[source_key],
+            "->",
+            round(frame[target_key], 3),
+            flush=True
+        )
+
 def _vision_score_ollama(
     frame_paths,
     motion,
@@ -347,68 +414,7 @@ def _vision_score_ollama(
                     base64.b64encode(f.read()).decode()
                 )
 
-        cv_summary = build_cv_summary(motion, yolo, ocr)
-        
-        prompt = f"""
-        The frames are ordered chronologically.
-
-        Frame 1 is the beginning of the clip.
-        Frame 5 is the end of the clip.
-
-        Judge the progression of the action across all frames instead of treating each image independently.
-        These are 5 frames taken from the SAME 15-second gameplay clip.
-
-        These frames have ALREADY been selected by an automated highlight detection pipeline.
-
-        Computer Vision Analysis
-
-        Motion Score : {motion:.2f}
-        YOLO Score   : {yolo:.2f}
-        OCR Score    : {ocr:.2f}
-
-        Summary:
-        {chr(10).join(cv_summary)}
-
-        Interpretation:
-
-        • Motion measures how dynamic the scene is.
-        • YOLO estimates how many important gameplay objects are visible.
-        • OCR detects reward text such as HEADSHOT, KILL, VICTORY, ACE, etc.
-
-        Your task is NOT to score this clip from scratch.
-
-        Instead:
-
-        1. Decide whether these frames show genuine gameplay.
-        2. Decide whether this is actually highlight-worthy.
-        3. Use the Computer Vision scores as evidence.
-        4. If the Computer Vision scores appear misleading, reduce your confidence.
-        5. If they agree with what you see, increase your confidence.
-
-        Return ONLY valid JSON.
-
-        {{
-            "gameplay": true,
-            "approve": true,
-            "confidence": 0.0,
-            "reason": "short reason under 12 words"
-        }}
-
-        Confidence guide:
-
-        1.00 = Exceptional highlight
-        0.90 = Excellent gameplay
-        0.80 = Strong highlight
-        0.70 = Good gameplay
-        0.60 = Average gameplay
-        0.40 = Weak highlight
-        0.20 = Probably not a highlight
-        0.00 = Not gameplay or definitely reject
-
-        Never return markdown.
-        Never explain your answer.
-        Return JSON only.
-        """
+        prompt = build_prompt(motion, yolo, ocr)
 
         #r = requests.post(f"{OLLAMA}/api/generate", json={
         #    "model": VISION_MODEL, "prompt": prompt, "images": [b64],
@@ -439,21 +445,10 @@ def _vision_score_ollama(
 
         data = json.loads(resp.get("response", "{}"))
 
-        gameplay = bool(data.get("gameplay", True))
+        return parse_vision_response(data)
 
-        approve = bool(data.get("approve", True))
-
-        confidence = float(
-            data.get("confidence", 0.5)
-        )
-
-        reason = str(
-            data.get("reason", "")
-        )
-
-        return gameplay, approve, confidence, reason
     except Exception as e:
-        return True, True, 0.5, f"score-failed:{e}"
+        return vision_failed(e)
 
 def _vision_score_lmstudio(
     frame_paths,
@@ -480,68 +475,7 @@ def _vision_score_lmstudio(
             })
 
 
-        cv_summary = build_cv_summary(motion, yolo, ocr)
-
-        prompt = f"""
-        The frames are ordered chronologically.
-
-        Frame 1 is the beginning of the clip.
-        Frame 5 is the end of the clip.
-
-        Judge the progression of the action across all frames instead of treating each image independently.
-        These are 5 frames taken from the SAME 15-second gameplay clip.
-
-        These frames have ALREADY been selected by an automated highlight detection pipeline.
-
-        Computer Vision Analysis
-
-        Motion Score : {motion:.2f}
-        YOLO Score   : {yolo:.2f}
-        OCR Score    : {ocr:.2f}
-
-        Summary:
-        {chr(10).join(cv_summary)}
-
-        Interpretation:
-
-        • Motion measures how dynamic the scene is.
-        • YOLO estimates how many important gameplay objects are visible.
-        • OCR detects reward text such as HEADSHOT, KILL, VICTORY, ACE, etc.
-
-        Your task is NOT to score this clip from scratch.
-
-        Instead:
-
-        1. Decide whether these frames show genuine gameplay.
-        2. Decide whether this is actually highlight-worthy.
-        3. Use the Computer Vision scores as evidence.
-        4. If the Computer Vision scores appear misleading, reduce your confidence.
-        5. If they agree with what you see, increase your confidence.
-
-        Return ONLY valid JSON.
-
-        {{
-            "gameplay": true,
-            "approve": true,
-            "confidence": 0.0,
-            "reason": "short reason under 12 words"
-        }}
-
-        Confidence guide:
-
-        1.00 = Exceptional highlight
-        0.90 = Excellent gameplay
-        0.80 = Strong highlight
-        0.70 = Good gameplay
-        0.60 = Average gameplay
-        0.40 = Weak highlight
-        0.20 = Probably not a highlight
-        0.00 = Not gameplay or definitely reject
-
-        Never return markdown.
-        Never explain your answer.
-        Return JSON only.
-        """
+        prompt = build_prompt(motion, yolo, ocr)
 
         content = [
             {
@@ -587,21 +521,10 @@ def _vision_score_lmstudio(
 
         data = json.loads(answer)
 
-        gameplay = bool(data.get("gameplay", True))
-
-        approve = bool(data.get("approve", True))
-
-        confidence = float(
-            data.get("confidence", 0.5)
-        )
-
-        reason = data.get("reason", "")
-
-        return gameplay, approve, confidence, reason
+        return parse_vision_response(data)
 
     except Exception as e:
-
-        return True, True, 0.5, f"lmstudio-failed:{e}"
+        return vision_failed(e)
 
 def _vision_score(
     frame_paths,
