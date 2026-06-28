@@ -389,7 +389,10 @@ def normalize_feature(
                 frame[source_key] - min_value
             ) / (max_value - min_value)
 
-    print(f"\n{target_key}", flush=True)
+    print(
+        f"\n=== {target_key.upper()} ===",
+        flush=True
+    )
 
     for frame in frames:
         print(
@@ -398,6 +401,14 @@ def normalize_feature(
             round(frame[target_key], 3),
             flush=True
         )
+
+def compute_fast_score(frame):
+
+    return (
+        frame["motion_norm"] * 0.40
+        + frame["yolo_norm"] * 0.30
+        + frame["ocr_norm"] * 0.30
+    )
 
 def _vision_score_ollama(
     frame_paths,
@@ -723,6 +734,26 @@ def refine_candidate(
     return best_time, best_motion
 
 
+def print_final_results(selected):
+
+    print("\n===== FINAL RANKING =====", flush=True)
+
+    for i, frame in enumerate(selected, 1):
+
+        print(
+            f"{i}. "
+            f"Time={frame['time']:.1f}s | "
+            f"Motion={frame['motion_norm']:.2f} | "
+            f"YOLO={frame['yolo_norm']:.2f} | "
+            f"OCR={frame['ocr_norm']:.2f} | "
+            f"Gameplay={frame['gameplay']} "
+            f"Approve={frame['approve']} "
+            f"Confidence={frame['confidence']:.2f} "
+            f"Final={frame['final_score']:.2f} "
+            f"Reason={frame['reason']}",
+            flush=True
+        )
+
 @app.post("/candidates")
 def candidates(inp: CandIn):
     full = os.path.join(MEDIA, inp.path)
@@ -898,81 +929,16 @@ def candidates(inp: CandIn):
 
         scored.append(frame)
 
-    motions = [f["motion"] for f in scored]
-    min_motion = min(motions)
-    max_motion = max(motions)
+    normalize_feature(scored, "motion", "motion_norm") 
+
+    normalize_feature(scored, "yolo", "yolo_norm")
+
+    normalize_feature(scored, "ocr", "ocr_norm")
 
     for frame in scored:
 
-        if max_motion == min_motion:
-            frame["motion_norm"] = 0.5
-        else:
-            frame["motion_norm"] = (
-                frame["motion"] - min_motion
-            ) / (max_motion - min_motion)   
-
-    for frame in scored:
-        print(
-            frame["motion"],
-            "->",
-            round(frame["motion_norm"], 3),
-            flush=True
-        ) 
-
-    yolos = [f["yolo"] for f in scored]
-
-    min_yolo = min(yolos)
-    max_yolo = max(yolos)
-
-    for frame in scored:
-
-        if max_yolo == min_yolo:
-            frame["yolo_norm"] = 0.5
-        else:
-            frame["yolo_norm"] = (
-                frame["yolo"] - min_yolo
-            ) / (max_yolo - min_yolo)
-
-    print("\nYOLO NORMALIZATION", flush=True)
-
-    for frame in scored:
-        print(
-            frame["yolo"],
-            "->",
-            round(frame["yolo_norm"], 3),
-            flush=True
-        )
-
-    ocrs = [f["ocr"] for f in scored]
-
-    min_ocr = min(ocrs)
-    max_ocr = max(ocrs)
-
-    for frame in scored:
-
-        if max_ocr == min_ocr:
-            frame["ocr_norm"] = 0.5
-        else:
-            frame["ocr_norm"] = (
-                frame["ocr"] - min_ocr
-            ) / (max_ocr - min_ocr)
-
-    print("\nOCR NORMALIZATION", flush=True)
-
-    for frame in scored:
-        print(
-            frame["ocr"],
-            "->",
-            round(frame["ocr_norm"], 3),
-            flush=True
-        )
-
-    for frame in scored:
-
-        frame["final_score"] = (
-            frame["motion_norm"] * 0.40
-            + frame["yolo_norm"] * 0.30
-            + frame["ocr_norm"] * 0.30
+        frame["final_score"] = compute_fast_score(
+            frame
         )
 
     scored.sort(
@@ -1045,22 +1011,7 @@ def candidates(inp: CandIn):
         if len(selected) == inp.count:
             break
 
-    print("\n===== FINAL RANKING =====", flush=True)
-
-    for i, frame in enumerate(selected, 1):
-        print(
-            f"{i}. "
-            f"Time={frame['time']:.1f}s | "
-            f"Motion={frame['motion_norm']:.2f} | "
-            f"YOLO={frame['yolo_norm']:.2f} | "
-            f"OCR={frame['ocr_norm']:.2f} | "
-            f"Gameplay={frame['gameplay']} "
-            f"Approve={frame['approve']} "
-            f"Confidence={frame['confidence']:.2f} "
-            f"Final={frame['final_score']:.2f} "
-            f"Reason={frame['reason']}",
-            flush=True
-)
+    print_final_results(selected)
 
     return {
         "dur": dur,
