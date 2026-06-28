@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+scenedetect[opencv-headless]
+instagrapi
+requests
+pillow
+opencv-python-headless
+ultralytics
+easyocr
