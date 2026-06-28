@@ -77,6 +77,54 @@ print("Loading YOLO...", flush=True)
 YOLO_MODEL = YOLO("yolov8n.pt")
 print("YOLO loaded.", flush=True)
 
+YOLO_WEIGHTS = {
+
+    "person": 2.0,
+
+    "car": 1.5,
+    "truck": 1.5,
+    "bus": 1.5,
+    "motorcycle": 1.5,
+    "bicycle": 1.2,
+
+    "airplane": 4.0,
+    "train": 4.0,
+
+    "boat": 2.0,
+
+    "dog": 0.5,
+    "cat": 0.5
+}
+
+OCR_WEIGHTS = {
+
+    "ACE": 10,
+
+    "VICTORY": 9,
+    "CHAMPION": 9,
+
+    "WIN": 8,
+
+    "QUAD": 8,
+
+    "TRIPLE": 7,
+
+    "HEADSHOT": 6,
+
+    "DOUBLE": 5,
+
+    "ELIMINATION": 4,
+
+    "KILL": 3,
+    "DOWNED": 3,
+
+    "+500": 5,
+    "+250": 3,
+    "+100": 1,
+
+    "XP": 0.5
+}
+
 print("Loading EasyOCR...", flush=True)
 
 ocr = easyocr.Reader(
@@ -122,15 +170,28 @@ def yolo_score(frame_path):
 
     boxes = result.boxes
 
-    if boxes is None:
-        return 0
+    if boxes is None or len(boxes) == 0:
+        return 0, []
 
     score = 0
+    detected = []
 
-    for conf in boxes.conf.tolist():
-        score += conf
+    names = result.names
 
-    return score
+    for cls, conf in zip(
+        boxes.cls.tolist(),
+        boxes.conf.tolist()
+    ):
+
+        label = names[int(cls)]
+
+        detected.append(label)
+
+        weight = YOLO_WEIGHTS.get(label, 1.0)
+
+        score += conf * weight
+
+    return score, detected
 
 def _extract_clip_frames(full, start, end, out_dir):
 
@@ -340,7 +401,90 @@ def _vision_score_lmstudio(frame_paths):
             })
 
         prompt = """
-        (YOUR CURRENT PROMPT HERE)
+        You are reviewing 5 images sampled chronologically from the SAME 15-second video clip.
+
+        Your task is to determine:
+
+        1. Is this clip primarily REAL GAMEPLAY?
+        2. If it is gameplay, how exciting would it be as a YouTube Shorts or TikTok gaming highlight?
+
+        GAMEPLAY includes:
+        - player controlling a character
+        - combat
+        - weapons
+        - platforming
+        - exploration
+
+        NOT GAMEPLAY includes:
+        - advertisements
+        - sponsor messages
+        - promotional videos
+        - game trailers
+        - loading screens
+        - menus
+        - inventory screens
+        - settings screens
+        - title screens
+        - streamer webcam only
+        - intermission screens
+        - overlays without actual gameplay
+
+        The 5 images represent the SAME clip.
+        Judge the ENTIRE clip, not an individual image.
+
+        When scoring gameplay, prioritize clips that contain:
+        - firefights
+        - kills or eliminations
+        - explosions
+        - intense movement
+        - close calls
+        - clutch moments
+        - visually exciting action
+
+        Avoid giving high scores to:
+        - walking
+        - looting
+        - waiting
+        - idle gameplay
+        - menus
+        - advertisements
+        - static scenes
+        
+        Assume the goal is to maximize viewer retention on YouTube Shorts and TikTok. Prefer clips that would make a viewer stop scrolling and continue watching.
+
+        Scoring:
+
+        10 = Incredible highlight, instantly shareable
+        9 = Outstanding action
+        8 = Intense combat
+        7 = Good action
+        6 = Decent gameplay
+        5 = Average gameplay
+        4 = Mostly slow gameplay
+        3 = Very little action
+        2 = Barely gameplay
+        1 = Idle or uninteresting gameplay
+
+        If the clip is NOT gameplay:
+
+        {
+            "gameplay": false,
+            "score": 0,
+            "reason": "short reason"
+        }
+
+        If the clip IS gameplay:
+
+        {
+            "gameplay": true,
+            "score": <integer 1-10>,
+            "reason": "<maximum 8 words>"
+        }
+
+        Return ONLY valid JSON.
+        Do not include markdown.
+        Do not include explanations.
+        Do not output any text outside the JSON.
         """
 
         content = [
@@ -463,29 +607,17 @@ def ocr_score(image_path):
 
     score = 0
 
-    keywords = [
-        "HEADSHOT",
-        "DOUBLE",
-        "TRIPLE",
-        "QUAD",
-        "ACE",
-        "KILL",
-        "ELIMINATION",
-        "VICTORY",
-        "WIN",
-        "DOWNED",
-        "XP",
-        "+100",
-        "+250",
-        "+500"
-    ]
+    matched = []
 
-    for word in keywords:
+    for word, weight in OCR_WEIGHTS.items():
+
         if word in text:
-            score += 1
 
-    return score, text
+            score += weight
+            matched.append(word)
 
+    return score, text, matched
+    
 def sample_video(duration, interval=2.0):
     times = []
 
@@ -522,6 +654,64 @@ def render_clip(source, start, end, output):
     print("OUTPUT FILE:", output, flush=True)
     print("STDERR:", result.stderr, flush=True)
     print("=" * 80, flush=True)
+
+def refine_candidate(
+    video_path,
+    approx_time,
+    duration,
+    job_id,
+    window=7.0,
+    step=0.5
+):
+
+    work = os.path.join(
+        MEDIA,
+        "work",
+        job_id,
+        "refine",
+        f"candidate_{int(approx_time)}"
+    )
+    os.makedirs(work, exist_ok=True)
+
+    best_time = approx_time
+    best_motion = -1
+
+    prev_frame = None
+
+    t = max(0.0, approx_time - window)
+
+    while t <= min(duration, approx_time + window):
+
+        img = os.path.join(
+            work,
+            f"{int(t*1000)}.jpg"
+        )
+
+        _extract_frame(video_path, t, img)
+
+        if prev_frame is not None:
+
+            m = motion_score(
+                prev_frame,
+                img
+            )
+
+            if m > best_motion:
+                best_motion = m
+                best_time = t
+
+        prev_frame = img
+
+        t += step
+
+    print(
+        f"Refined {approx_time:.2f}s -> {best_time:.2f}s "
+        f"(motion={best_motion:.2f})",
+        flush=True
+    )
+
+    return best_time, best_motion
+
 
 @app.post("/candidates")
 def candidates(inp: CandIn):
@@ -594,13 +784,13 @@ def candidates(inp: CandIn):
         curr["frame"]
         )
         
-        yolo = yolo_score(curr["frame"])
+        yolo, yolo_hits = yolo_score(curr["frame"])
 
         motion_frames.append({
             "idx": curr["idx"], "time": curr["time"], 
             "start": curr["start"], "end": curr["end"], 
             "frame": curr["frame"], "frame_rel": curr["frame_rel"],
-            "motion": motion, "yolo": yolo
+            "motion": motion, "yolo": yolo, "yolo_hits": yolo_hits
         })
     
     motion_frames.sort(
@@ -621,6 +811,38 @@ def candidates(inp: CandIn):
     )
 
     interesting = motion_frames[:candidate_count]
+
+    for frame in interesting:
+
+        refined_time, refined_motion = refine_candidate(
+            full,
+            frame["time"],
+            dur,
+            inp.jobId
+        )
+
+        frame["time"] = refined_time
+        frame["motion"] = refined_motion
+
+        frame["start"] = max(
+            0,
+            refined_time - inp.clipLen / 2
+        )
+        frame["end"] = min(
+            dur,
+            frame["start"] + inp.clipLen
+        )
+
+    print("\n===== AFTER REFINEMENT =====", flush=True)
+
+    for frame in interesting:
+        print(
+            f"Time={frame['time']:.2f}s "
+            f"Motion={frame['motion']:.2f} "
+            f"YOLO={frame['yolo']:.2f}",
+            f"Objects={frame['yolo_hits']}",
+            flush=True
+        )
 
     for frame in interesting:
         print(
@@ -650,19 +872,18 @@ def candidates(inp: CandIn):
             clip_dir
         )
 
-        pts, txt = ocr_score(clip_frames[2])
+        ocr_points, ocr_text, ocr_hits = ocr_score(clip_frames[2])
 
-        frame["ocr"] = pts
-        frame["ocr_text"] = txt
+        frame["ocr"] = ocr_points
+        frame["ocr_text"] = ocr_text
+        frame["ocr_hits"] = ocr_hits
 
         print(
-            "OCR:",
-            frame["ocr"],
-            "|",
-            frame["ocr_text"][:120],
+            f"OCR={frame['ocr']:.1f}",
+            f"Hits={ocr_hits}",
+            f"Text={frame['ocr_text'][:80]}",
             flush=True
         )
-
         frame["vision_score"] = 0
         frame["reason"] = ""
 
@@ -689,12 +910,60 @@ def candidates(inp: CandIn):
             flush=True
         ) 
 
+    yolos = [f["yolo"] for f in scored]
+
+    min_yolo = min(yolos)
+    max_yolo = max(yolos)
+
+    for frame in scored:
+
+        if max_yolo == min_yolo:
+            frame["yolo_norm"] = 0.5
+        else:
+            frame["yolo_norm"] = (
+                frame["yolo"] - min_yolo
+            ) / (max_yolo - min_yolo)
+
+    print("\nYOLO NORMALIZATION", flush=True)
+
+    for frame in scored:
+        print(
+            frame["yolo"],
+            "->",
+            round(frame["yolo_norm"], 3),
+            flush=True
+        )
+
+    ocrs = [f["ocr"] for f in scored]
+
+    min_ocr = min(ocrs)
+    max_ocr = max(ocrs)
+
+    for frame in scored:
+
+        if max_ocr == min_ocr:
+            frame["ocr_norm"] = 0.5
+        else:
+            frame["ocr_norm"] = (
+                frame["ocr"] - min_ocr
+            ) / (max_ocr - min_ocr)
+
+    print("\nOCR NORMALIZATION", flush=True)
+
+    for frame in scored:
+        print(
+            frame["ocr"],
+            "->",
+            round(frame["ocr_norm"], 3),
+            flush=True
+        )
+
     for frame in scored:
 
         frame["final_score"] = (
-            frame["motion_norm"] * 4
-            + frame["yolo"] * 2
-            + frame["ocr"] * 1
+            frame["motion_norm"] * 0.40
+            + frame["yolo_norm"] * 0.30
+            + frame["ocr_norm"] * 0.30
         )
 
     scored.sort(
@@ -707,7 +976,7 @@ def candidates(inp: CandIn):
     interesting = scored[:llava_candidates]
 
     print(
-        f"Running LLaVA on {len(interesting)} clips",
+        f"Running {VISION_BACKEND} ({VISION_MODEL}) on {len(interesting)} clips",
         flush=True
     )
 
