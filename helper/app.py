@@ -754,6 +754,26 @@ def print_final_results(selected):
             flush=True
         )
 
+def load_clip_frames(
+    video_path,
+    frame,
+    job_id
+):
+
+    clip_dir = os.path.join(
+        MEDIA,
+        "work",
+        job_id,
+        f"clip_{frame['idx']}"
+    )
+
+    return _extract_clip_frames(
+        video_path,
+        frame["start"],
+        frame["end"],
+        clip_dir
+    )
+
 @app.post("/candidates")
 def candidates(inp: CandIn):
     full = os.path.join(MEDIA, inp.path)
@@ -885,33 +905,12 @@ def candidates(inp: CandIn):
             flush=True
         )
 
-    for frame in interesting:
-        print(
-            "Motion:",
-            round(frame["motion"], 2),
-            "YOLO:",
-            round(frame["yolo"], 2),
-            flush=True
-        )
-
     print(f"Scoring {len(interesting)} frames with OCR only", flush=True)
 
     scored = []
     for frame in interesting:
 
-        clip_dir = os.path.join(
-            MEDIA,
-            "work",
-            inp.jobId,
-            f"clip_{frame['idx']}"
-        )
-
-        clip_frames = _extract_clip_frames(
-            full,
-            frame["start"],
-            frame["end"],
-            clip_dir
-        )
+        clip_frames = load_clip_frames(full, frame, inp.jobId)
 
         ocr_points, ocr_text, ocr_hits = ocr_score(clip_frames[2])
 
@@ -957,19 +956,7 @@ def candidates(inp: CandIn):
 
     for frame in interesting:
 
-        clip_dir = os.path.join(
-            MEDIA,
-            "work",
-            inp.jobId,
-            f"clip_{frame['idx']}"
-        )
-
-        clip_frames = _extract_clip_frames(
-            full,
-            frame["start"],
-            frame["end"],
-            clip_dir
-        )
+        clip_frames = load_clip_frames(full, frame, inp.jobId)
 
         gameplay, approve, confidence, reason = _vision_score(
             clip_frames,
