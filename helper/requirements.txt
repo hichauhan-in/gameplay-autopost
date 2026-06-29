@@ -6,4 +6,5 @@ requests
 pillow
 opencv-python-headless
 ultralytics
+rapidocr-onnxruntime
 easyocr

@@ -4,11 +4,22 @@ import re, base64, requests
 import math
 import numpy as np
 
-from motion import motion_score
+from motion import motion_score, frame_quality
 from fastapi import FastAPI
 from pydantic import BaseModel
 from ultralytics import YOLO
-import easyocr
+
+try:
+    from rapidocr_onnxruntime import RapidOCR
+    HAVE_RAPIDOCR = True
+except Exception:
+    HAVE_RAPIDOCR = False
+
+try:
+    import easyocr
+    HAVE_EASYOCR = True
+except Exception:
+    HAVE_EASYOCR = False
 
 app = FastAPI()
 MEDIA = "/data/media"
@@ -135,14 +146,29 @@ OCR_WEIGHTS = {
     "XP": 0.5
 }
 
-print("Loading EasyOCR...", flush=True)
+# OCR backend: RapidOCR (ONNXRuntime, CPU) is the default — much faster than
+# EasyOCR with comparable accuracy on reward text. EasyOCR is kept as a
+# fallback. To move OCR onto an AMD/Windows GPU later, run RapidOCR on the
+# host with onnxruntime-directml; the call sites here stay identical.
+OCR_ENGINE = ""
+rapid_ocr = None
+ocr = None
 
-ocr = easyocr.Reader(
-    ['en'],
-    gpu=False
-)
-
-print("EasyOCR loaded.", flush=True)
+if HAVE_RAPIDOCR:
+    print("Loading RapidOCR...", flush=True)
+    rapid_ocr = RapidOCR()
+    OCR_ENGINE = "rapidocr"
+    print("RapidOCR loaded.", flush=True)
+elif HAVE_EASYOCR:
+    print("Loading EasyOCR...", flush=True)
+    ocr = easyocr.Reader(
+        ['en'],
+        gpu=False
+    )
+    OCR_ENGINE = "easyocr"
+    print("EasyOCR loaded.", flush=True)
+else:
+    print("WARNING: no OCR backend available; OCR scores will be 0.", flush=True)
 
 def _loudness_curve(full, hop=0.25):
     """
@@ -223,6 +249,49 @@ def clip_audio_score(times, vals, start, end):
             best_jump = jump
 
     return best_jump
+
+def clip_quality_score(frame_paths):
+    """
+    Visual quality of a clip from its 5 stills, model-free.
+
+    Frozen/loading/blurred frames have low Laplacian variance; black/loading
+    screens have near-zero brightness. We average sharpness across frames and
+    zero the score for clips that are too dark, so static or loading clips
+    rank below real action even when motion looks high from a single cut.
+    """
+    sharps = []
+    brights = []
+    for fp in frame_paths:
+        s, b = frame_quality(fp)
+        sharps.append(s)
+        brights.append(b)
+
+    if not sharps:
+        return 0.0
+
+    mean_sharp = sum(sharps) / len(sharps)
+    mean_bright = sum(brights) / len(brights)
+
+    # Kill clips that are basically black (loading / fade) regardless of sharp.
+    if mean_bright < 18.0:
+        return 0.0
+
+    return mean_sharp
+
+def cut_density_score(boundary_cuts, start, end):
+    """
+    Reward a clip with ~one clean scene change (a kill/replay transition) and
+    penalise both zero cuts (static) and many cuts (menus/montage churn).
+    Returns a 0..1 score; uses cuts we already detected, so it is free.
+    """
+    cuts = sum(1 for c in boundary_cuts if start < c < end)
+    if cuts == 0:
+        return 0.3
+    if cuts <= 2:
+        return 1.0
+    if cuts <= 4:
+        return 0.6
+    return 0.2
 
 def _extract_frame(full, t, out_path):
     subprocess.run(["ffmpeg", "-y", "-ss", str(t), "-i", full,
@@ -387,14 +456,25 @@ Summary:
    logos, intros, outros, menus, loading screens, scoreboards, desktop,
    webcam / face-cam, black screens, OR frozen / static frames where almost
    nothing changes across the 5 frames.
-2. approve  : true only if this is genuinely highlight-worthy. Reject
-   (approve = false) advertisements, promos, intros / outros, and static
-   or idle moments even if a game image is technically visible.
+2. approve  : true only if this is genuinely highlight-worthy ACTION. Reject
+   (approve = false): advertisements, promos, intros / outros, and ALSO low-
+   action filler even if it is real gameplay - inventory / menu / map / shop /
+   loadout screens, lock-picking or safe-cracking, idle standing, slow walking
+   or running with nothing happening, and crafting / looting. A highlight needs
+   a real moment: a fight, kill, chase, explosion, clutch or escape. If the 5
+   frames are mostly menu, inventory, or just walking, approve = false.
 3. confidence : how strong this highlight is (see guide below).
 4. Use the CV scores as supporting evidence:
    - If the visuals agree with the scores, raise your confidence.
    - If the scores look misleading (e.g. high motion but nothing happens),
      lower your confidence.
+5. Engagement signals (these decide how well the clip performs on Shorts /
+   Reels / TikTok). Be honest; most clips are average:
+   - hook       : 0.0-1.0, does the FIRST frame instantly grab attention?
+   - multikill  : true if a kill / multi-kill / big play is clearly visible.
+   - clutch     : true if it looks like a comeback or high-stakes moment.
+   - funny      : true if it is funny / surprising / meme-worthy.
+   - vertical   : true if the main action is centered and survives a 9:16 crop.
 
 Consistency rules:
 - If gameplay is false, approve MUST be false and confidence MUST be 0.00.
@@ -417,6 +497,11 @@ Return ONLY this JSON object, nothing else:
     "gameplay": true,
     "approve": true,
     "confidence": 0.0,
+    "hook": 0.0,
+    "multikill": false,
+    "clutch": false,
+    "funny": false,
+    "vertical": true,
     "reason": "short reason under 12 words"
 }}
 
@@ -440,6 +525,21 @@ def parse_vision_response(data):
     reason = str(
         data.get("reason", "")
     )
+
+    # Engagement boost: clips with a strong hook or a clear money moment win on
+    # short-form platforms. Only nudge approved gameplay; rejects stay rejected.
+    if gameplay and approve:
+        hook = float(data.get("hook", 0.0) or 0.0)
+        bonus = hook * 0.10
+        if data.get("multikill"):
+            bonus += 0.10
+        if data.get("clutch"):
+            bonus += 0.07
+        if data.get("funny"):
+            bonus += 0.05
+        if not data.get("vertical", True):
+            bonus -= 0.05
+        confidence = max(0.0, min(1.0, confidence + bonus))
 
     return (
         gameplay,
@@ -496,10 +596,12 @@ def normalize_feature(
 def compute_fast_score(frame):
 
     return (
-        frame["motion_norm"] * 0.40
-        + frame["ocr_norm"] * 0.35
-        + frame["audio_norm"] * 0.15
-        + frame["yolo_norm"] * 0.10
+        frame["motion_norm"] * 0.42
+        + frame["ocr_norm"] * 0.23
+        + frame["audio_norm"] * 0.13
+        + frame["yolo_norm"] * 0.07
+        + frame.get("quality_norm", 0.5) * 0.10
+        + frame.get("cuts_norm", 0.5) * 0.05
     )
 
 def split_video_jobs(
@@ -730,6 +832,11 @@ class CandIn(BaseModel):
     sampleInterval: float = 2.0
     topMotion: int = 20
     finalCandidates: int = 4
+    # OCR + vision are the slow stages. We refine all topMotion candidates
+    # (cheap motion math) but only run OCR/vision on the strongest ones.
+    # 0 == auto: half of the refined candidates (never below finalCandidates).
+    # Set a positive number to force an exact cap. Lower = faster.
+    ocrTop: int = 0
     # 0 == "auto": fall back to one clip length so highlights can sit
     # back-to-back instead of being forced 30 s apart.
     minGap: float = 0.0
@@ -743,6 +850,9 @@ class RenderClip(BaseModel):
     # Best-to-worst position (1 = best). Used only to name the output file so
     # the editor / uploader can post them in order. 0 == fall back to index.
     rank: int = 0
+    # Which segment of a long video this clip came from (1-based). 0 == single
+    # segment. Used to render into that segment's own folder.
+    segment: int = 0
 
 
 class RenderIn(BaseModel):
@@ -811,12 +921,20 @@ def detect_scenes(full, min_threshold=0.12):
 
 def ocr_score(image_path):
 
-    results = ocr.readtext(image_path)
-
-    text = " ".join(
-        r[1]
-        for r in results
-    ).upper()
+    if OCR_ENGINE == "rapidocr":
+        result, _ = rapid_ocr(image_path)
+        text = " ".join(
+            r[1]
+            for r in (result or [])
+        ).upper()
+    elif OCR_ENGINE == "easyocr":
+        results = ocr.readtext(image_path)
+        text = " ".join(
+            r[1]
+            for r in results
+        ).upper()
+    else:
+        text = ""
 
     score = 0
 
@@ -1483,6 +1601,39 @@ def process_job(
             flush=True
         )
 
+    # OCR (EasyOCR on CPU) is the single slowest stage - 5 frames per clip,
+    # extracted + read. Only the strongest candidates are worth that cost.
+    # ocrTop 0 == auto: keep about half the refined candidates; otherwise use
+    # the explicit cap. Never fewer than finalCandidates so enough survive.
+    auto_top = max(inp.finalCandidates, (len(interesting) + 1) // 2)
+    ocr_top = inp.ocrTop if inp.ocrTop and inp.ocrTop > 0 else auto_top
+    ocr_top = max(inp.finalCandidates, min(ocr_top, len(interesting)))
+
+    # Pre-OCR gate. OCR is the slow stage, so we only run it on the strongest
+    # half. Rank on every cheap signal we already have (motion, YOLO objects,
+    # audio) instead of motion alone, so a clip that is loud or object-rich but
+    # only moderately fast still survives. OCR is the only feature missing here,
+    # so it cannot be used yet. Audio is scored now and reused in the OCR loop.
+    for frame in interesting:
+        frame["audio"] = clip_audio_score(
+            audio_times,
+            audio_vals,
+            frame["start"],
+            frame["end"]
+        )
+    normalize_feature(interesting, "motion", "motion_norm")
+    normalize_feature(interesting, "yolo", "yolo_norm")
+    normalize_feature(interesting, "audio", "audio_norm")
+    interesting.sort(
+        key=lambda x: (
+            x["motion_norm"] * 0.60
+            + x["audio_norm"] * 0.20
+            + x["yolo_norm"] * 0.20
+        ),
+        reverse=True
+    )
+    interesting = interesting[:ocr_top]
+
     print(f"Scoring {len(interesting)} frames with OCR only", flush=True)
 
     scored = []
@@ -1500,9 +1651,10 @@ def process_job(
         frame["ocr_text"] = ocr_text
         frame["ocr_hits"] = ocr_hits
 
-        frame["audio"] = clip_audio_score(
-            audio_times,
-            audio_vals,
+        # Cheap technical-quality signals reusing the 5 frames we just loaded.
+        frame["quality"] = clip_quality_score(clip_frames)
+        frame["cuts"] = cut_density_score(
+            boundary_cuts,
             frame["start"],
             frame["end"]
         )
@@ -1511,6 +1663,8 @@ def process_job(
             f"OCR={frame['ocr']:.1f}",
             f"Hits={ocr_hits}",
             f"Audio={frame['audio']:.1f}",
+            f"Quality={frame['quality']:.0f}",
+            f"Cuts={frame['cuts']:.1f}",
             f"Text={frame['ocr_text'][:80]}",
             flush=True
         )
@@ -1526,6 +1680,10 @@ def process_job(
 
     normalize_feature(scored, "audio", "audio_norm")
 
+    normalize_feature(scored, "quality", "quality_norm")
+
+    normalize_feature(scored, "cuts", "cuts_norm")
+
     for frame in scored:
 
         frame["final_score"] = compute_fast_score(
@@ -1537,7 +1695,13 @@ def process_job(
         reverse=True
     )
 
-    llava_candidates = min(6, len(scored))
+    # Vision is the most expensive stage, so feed it half the OCR survivors
+    # (rounded up), never fewer than finalCandidates, never more than 6. Short
+    # videos with few OCR clips shrink naturally; long ones stay capped.
+    llava_candidates = max(
+        inp.finalCandidates,
+        min(6, (len(scored) + 1) // 2)
+    )
 
     interesting = scored[:llava_candidates]
 
@@ -1715,6 +1879,7 @@ def candidates(inp: CandIn):
             frame["time"] += job["start"]
             frame["start"] += job["start"]
             frame["end"] += job["start"]
+            frame["segment"] = job["job"] if len(jobs) > 1 else 0
 
         all_selected.extend(selected)
 
@@ -1755,10 +1920,15 @@ def candidates(inp: CandIn):
     if inp.maxCandidates and inp.maxCandidates > 0:
         final = final[:inp.maxCandidates]
 
-    # final is already sorted best -> worst by final_score. Stamp an explicit
-    # 1-based rank so the editor / uploader can post them in order.
+    # final is already sorted best -> worst by final_score. Stamp a global rank
+    # for overall posting order, plus a per-segment rank so each segment's
+    # render folder gets clip_1, clip_2, ... independently.
+    seg_counts = {}
     for idx, frame in enumerate(final):
         frame["rank"] = idx + 1
+        seg = frame.get("segment", 0)
+        seg_counts[seg] = seg_counts.get(seg, 0) + 1
+        frame["segment_rank"] = seg_counts[seg]
 
     return {
         "dur": dur,
@@ -1797,8 +1967,17 @@ def render(inp: RenderIn):
 
         rank = clip.rank if clip.rank else i + 1
 
+        # Long videos are split into segments; each segment renders into its
+        # own folder so clips stay grouped by where they came from. Single
+        # segment (segment == 0) keeps the flat renders/ layout.
+        if clip.segment and clip.segment > 0:
+            clip_dir = os.path.join(out_dir, f"segment_{clip.segment}")
+        else:
+            clip_dir = out_dir
+        os.makedirs(clip_dir, exist_ok=True)
+
         out_file = os.path.join(
-            out_dir,
+            clip_dir,
             f"clip_{rank}.mp4"
         )
 
@@ -1812,10 +1991,70 @@ def render(inp: RenderIn):
             fade=inp.fade
         )
 
-        rendered.append(
-            f"work/{inp.jobId}/renders/clip_{rank}.mp4"
-        )
+        if clip.segment and clip.segment > 0:
+            rendered.append(
+                f"work/{inp.jobId}/renders/segment_{clip.segment}/clip_{rank}.mp4"
+            )
+        else:
+            rendered.append(
+                f"work/{inp.jobId}/renders/clip_{rank}.mp4"
+            )
 
     return {
         "clips": rendered
+    }
+
+
+class FinalizeIn(BaseModel):
+    jobId: str
+    name: str = ""
+
+
+@app.post("/finalize")
+def finalize(inp: FinalizeIn):
+    """End-of-flow cleanup. Keeps only work/<jobId>/renders. Moves source.mp4
+    to media/archive and every other intermediate (frames, refine, clips and
+    any segment_* dirs) to media/temp/<jobId>. Nothing is deleted - the user
+    can clear media/temp manually."""
+
+    work_dir = os.path.join(MEDIA, "work", inp.jobId)
+    if not os.path.isdir(work_dir):
+        return {"ok": False, "reason": f"no work dir for {inp.jobId}"}
+
+    archive_dir = os.path.join(MEDIA, "archive")
+    temp_dir = os.path.join(MEDIA, "temp", inp.jobId)
+    os.makedirs(archive_dir, exist_ok=True)
+    os.makedirs(temp_dir, exist_ok=True)
+
+    archived = None
+    moved = []
+
+    for entry in os.listdir(work_dir):
+        src = os.path.join(work_dir, entry)
+
+        # Keep the final renders in work.
+        if entry == "renders":
+            continue
+
+        # Source video -> archive, named after the job.
+        if entry == "source.mp4":
+            dst = os.path.join(archive_dir, f"{inp.jobId}.mp4")
+            shutil.move(src, dst)
+            archived = os.path.relpath(dst, MEDIA)
+            continue
+
+        # Everything else (frames, refine, clips, segment_* ...) -> temp.
+        dst = os.path.join(temp_dir, entry)
+        if os.path.exists(dst):
+            shutil.rmtree(dst) if os.path.isdir(dst) else os.remove(dst)
+        shutil.move(src, dst)
+        moved.append(entry)
+
+    print(f"FINALIZE {inp.jobId}: archived={archived} moved={moved}", flush=True)
+
+    return {
+        "ok": True,
+        "archived": archived,
+        "moved": moved,
+        "temp": f"temp/{inp.jobId}",
     }

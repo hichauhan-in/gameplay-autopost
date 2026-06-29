@@ -49,10 +49,17 @@ services:
     build: ./helper
     restart: unless-stopped
     environment:
-      - VISION_BACKEND=ollama
+      # --- Backend URLs (always present) ---
       - OLLAMA_URL=http://host.docker.internal:11434
       - LMSTUDIO_URL=http://host.docker.internal:1234/v1/chat/completions
-      - VISION_MODEL=llava:13b
+      # --- Pick ONE backend: comment one block, uncomment the other ---
+      # Ollama:
+      - VISION_BACKEND=ollama
+      # - VISION_MODEL=llava:13b
+      - VISION_MODEL=qwen2.5vl:7b
+      # LM Studio:
+      # - VISION_BACKEND=lmstudio
+      # - VISION_MODEL=qwen2.5-vl-7b-instruct
     ports:
       - "8000:8000"
     volumes:

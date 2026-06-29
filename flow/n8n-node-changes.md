@@ -35,6 +35,7 @@ What each field now does in the API:
 - `clipMax`         -> longest allowed clip (seconds). 0 = use fixed `clipLen`.
 - `sampleInterval`  -> fallback frame sampling interval when scene detection finds too few scenes
 - `topMotion`       -> how many top-motion candidates to keep before scoring
+- `ocrTop`          -> how many candidates to OCR + vision-score. 0 = auto (half the refined candidates). Lower = much faster; never below `finalCandidates`
 - `finalCandidates` -> how many final clips to return
 
 **How the range works:** the clip is centred on the busiest moment, then its
@@ -96,14 +97,18 @@ return [{
 
 Field reference (each candidate object returned by `/candidates`):
 - `rank`               -> 1-based posting order (1 = best); list is pre-sorted best -> worst
+- `segment`            -> which segment of a long video the clip came from (1,2,3...; 0 = single segment)
+- `segment_rank`       -> 1-based rank WITHIN its segment (so each segment renders clip_1, clip_2, clip_3)
 - `start`, `end`        -> clip time range in seconds (absolute, in the source video)
 - `time`               -> the peak moment inside the clip
 - `motion`             -> raw motion value
 - `motion_norm`, `yolo_norm`, `ocr_norm`, `audio_norm` -> normalized 0..1 feature scores
+- `quality_norm`       -> 0..1 sharpness/brightness (drops blurry, frozen, black/loading clips)
+- `cuts_norm`          -> 0..1 scene-cut density (rewards one clean kill/replay cut, penalises menus)
 - `audio`              -> raw smart-loudness value (largest short-term loudness jump in the clip)
 - `audio_norm`         -> normalized 0..1 smart-loudness (impact sounds, not loud talking)
 - `final_score`        -> combined score (already multiplied by vision confidence)
-- `confidence` / `vision_score` -> vision model confidence (same value)
+- `confidence` / `vision_score` -> vision model confidence, boosted by engagement (hook/multikill/clutch/funny/vertical)
 - `gameplay`, `approve` -> vision model booleans
 - `reason`             -> short text reason from the vision model
 - `frame`              -> absolute path inside the container (`/data/media/...`)
@@ -137,15 +142,19 @@ if (!cands.length) {
 
 const job = $('Job Info').first().json;
 
-// API already sorts best -> worst and stamps `rank`. Take up to 3.
-const top = cands.slice(0, 3);
+// Keep the best 3 of EACH segment (a 40-min video = ~3 segments = up to 9
+// clips). cands is pre-sorted best->worst, so each group is too. For a single
+// segment this is just the global top 3.
+const bySeg = {};
+for (const c of cands) (bySeg[c.segment || 0] ||= []).push(c);
+const top = Object.values(bySeg).flatMap(g => g.slice(0, 3));
 
 return [{
     json: {
         jobId: job.jobId,
         name: job.name,
         path: job.path,
-        topClips: top,        // <- array of up to 3, in posting order
+        topClips: top,        // <- up to 3 per segment, in posting order
         allCandidates: cands
     }
 }];
@@ -163,8 +172,7 @@ don't need to send `aspect`/`cropMode`/`fade` at all:
     "jobId": "{{ $json.jobId }}",
     "clips": {{ JSON.stringify(
         ($json.topClips || $json.allCandidates || ($json.best ? [$json.best] : []))
-            .slice(0, 3)
-            .map(c => ({ start: c.start, end: c.end, rank: c.rank || 0 }))
+            .map(c => ({ start: c.start, end: c.end, rank: c.segment_rank || c.rank || 0, segment: c.segment || 0 }))
     ) }}
 }
 ```
@@ -173,12 +181,18 @@ This still gives you the **top 3 ranked clips** at near-lossless quality with
 the source resolution preserved (4K stays 4K). When we start editing, add
 `"aspect": "9:16"`, `"cropMode": "center"`, `"fade": 0.5` to switch to Shorts.
 
+> Pass `segment` through so long videos render into per-segment folders:
+> `work/<jobId>/renders/segment_1/clip_1.mp4`. Single-segment videos keep the
+> flat `work/<jobId>/renders/clip_1.mp4` layout (segment 0). Drop `top.slice(0,3)`
+> to render every candidate from every segment instead of only the global top 3.
+
 > Make sure the Render node's input item still has `path` and `jobId` (they
 > come from the **Job Info** node). If Pick Best drops them, add them back
 > there.
 
 The response is `{ "clips": [ "work/<jobId>/renders/clip_1.mp4", ... ] }` where
-`clip_1` is the best. Post them in numeric order.
+`clip_1` is the best. For long videos clips are grouped per segment, e.g.
+`work/<jobId>/renders/segment_2/clip_3.mp4`. Post them in numeric rank order.
 
 **Render options you can change in the body:**
 - `aspect`   -> `"9:16"` (Shorts/Reels/TikTok, default), `"4:5"`, `"1:1"`,
@@ -190,6 +204,50 @@ The response is `{ "clips": [ "work/<jobId>/renders/clip_1.mp4", ... ] }` where
 
 > Tip: if your HUD (health/ammo/score) sits near the left or right edge and a
 > center crop hides it, switch `cropMode` to `"blur"`.
+
+---
+
+## 4. CLEANUP  (HTTP Request -> POST /finalize)  **REQUIRED for cleanup**
+
+Add ONE node after Render Clips. Without it nothing is moved and every job
+keeps `source.mp4 / frames / refine / clips / renders` under `work/<jobId>`.
+
+```json
+{
+    "jobId": "{{ $json.jobId }}",
+    "name": "{{ $json.name }}"
+}
+```
+
+Method: POST · URL: `http://helper:8000/finalize`.
+
+After it runs, the job folder is cleaned:
+- `work/<jobId>/renders/` -> kept (your final clips)
+- `source.mp4` -> moved to `media/archive/<name>.mp4`
+- `frames/`, `refine/`, `clips/`, `segment_*` -> moved to `media/temp/<jobId>/`
+- nothing deleted; clear `media/temp` manually when you want.
+
+> `jobId` and `name` both come from the **Claim/Job Info** node. If Render's
+> last item dropped them, re-add them before this node.
+
+---
+
+
+## How the helper ranks clips (internal, no n8n change)
+
+The funnel is cheap-first, expensive-last. Counts scale with video length —
+nothing is hardcoded except a vision cap of 6.
+
+1. **Coarse scan** — sample frames, score motion + YOLO. Keep top `topMotion` (≤20, capped by `duration / clipLen`).
+2. **Refine** — dense 0.5s motion sweep per candidate to find the exact peak + snap to scene cuts.
+3. **Pre-OCR gate** — keep half on cheap signals: motion 60% + audio 20% + YOLO 20%.
+4. **OCR + tech quality** — RapidOCR (CPU, ONNX) reads reward text; sharpness/brightness + scene-cut density scored from the same 5 stills.
+5. **Vision** — half of OCR survivors (≤6) judged by llava: gameplay/approve/confidence + hook/multikill/clutch/funny/vertical engagement boost.
+6. **Render** — `finalCandidates` per segment, deduped, ranked, capped by `maxCandidates`.
+
+- **OCR engine:** RapidOCR (`rapidocr-onnxruntime`), EasyOCR fallback. CPU-only; AMD GPU not usable in Docker-on-Windows.
+- **Combined score:** motion .35, OCR .30, audio .13, quality .10, YOLO .07, cuts .05 — then ×vision confidence.
+- **Per segment:** a 40-min video splits into ~3 segments, each with its own `clips/`, `refine/`, and `renders/segment_N/` folders, ~3 clips each (fewer if short).
 
 ---
 
